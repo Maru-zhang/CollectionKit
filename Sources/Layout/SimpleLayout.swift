@@ -8,13 +8,11 @@
 
 import UIKit
 
-open class SimpleLayout<Data>: CollectionLayout<Data> {
+open class SimpleLayout: Layout {
   var _contentSize: CGSize = .zero
   public private(set) var frames: [CGRect] = []
 
-  open func simpleLayout(collectionSize: CGSize,
-                         dataProvider: CollectionDataProvider<Data>,
-                         sizeProvider: @escaping CollectionSizeProvider<Data>) -> [CGRect] {
+  open func simpleLayout(context: LayoutContext) -> [CGRect] {
     fatalError("Subclass should provide its own layout")
   }
 
@@ -22,11 +20,8 @@ open class SimpleLayout<Data>: CollectionLayout<Data> {
 
   }
 
-  public final override func layout(collectionSize: CGSize,
-                                    dataProvider: CollectionDataProvider<Data>,
-                                    sizeProvider: @escaping CollectionSizeProvider<Data>) {
-    frames = simpleLayout(collectionSize: collectionSize,
-                          dataProvider: dataProvider, sizeProvider: sizeProvider)
+  public final override func layout(context: LayoutContext) {
+    frames = simpleLayout(context: context)
     _contentSize = frames.reduce(CGRect.zero) { (old, item) in
       old.union(item)
     }.size
@@ -41,10 +36,10 @@ open class SimpleLayout<Data>: CollectionLayout<Data> {
     return frames[at]
   }
 
-  open override func visibleIndexes(activeFrame: CGRect) -> [Int] {
+  open override func visibleIndexes(visibleFrame: CGRect) -> [Int] {
     var result = [Int]()
     for (i, frame) in frames.enumerated() {
-      if frame.intersects(activeFrame) {
+      if frame.intersects(visibleFrame) {
         result.append(i)
       }
     }
@@ -52,22 +47,22 @@ open class SimpleLayout<Data>: CollectionLayout<Data> {
   }
 }
 
-open class VerticalSimpleLayout<Data>: SimpleLayout<Data> {
+open class VerticalSimpleLayout: SimpleLayout {
   private var maxFrameLength: CGFloat = 0
 
   open override func doneLayout() {
     maxFrameLength = frames.max { $0.height < $1.height }?.height ?? 0
   }
 
-  open override func visibleIndexes(activeFrame: CGRect) -> [Int] {
-    var index = frames.binarySearch { $0.minY < activeFrame.minY - maxFrameLength }
+  open override func visibleIndexes(visibleFrame: CGRect) -> [Int] {
+    var index = frames.binarySearch { $0.minY < visibleFrame.minY - maxFrameLength }
     var visibleIndexes = [Int]()
     while index < frames.count {
       let frame = frames[index]
-      if frame.minY >= activeFrame.maxY {
+      if frame.minY >= visibleFrame.maxY {
         break
       }
-      if frame.maxY > activeFrame.minY {
+      if frame.maxY > visibleFrame.minY {
         visibleIndexes.append(index)
       }
       index += 1
@@ -76,22 +71,22 @@ open class VerticalSimpleLayout<Data>: SimpleLayout<Data> {
   }
 }
 
-open class HorizontalSimpleLayout<Data>: SimpleLayout<Data> {
+open class HorizontalSimpleLayout: SimpleLayout {
   private var maxFrameLength: CGFloat = 0
 
   open override func doneLayout() {
     maxFrameLength = frames.max { $0.width < $1.width }?.width ?? 0
   }
 
-  open override func visibleIndexes(activeFrame: CGRect) -> [Int] {
-    var index = frames.binarySearch { $0.minX < activeFrame.minX - maxFrameLength }
+  open override func visibleIndexes(visibleFrame: CGRect) -> [Int] {
+    var index = frames.binarySearch { $0.minX < visibleFrame.minX - maxFrameLength }
     var visibleIndexes = [Int]()
     while index < frames.count {
       let frame = frames[index]
-      if frame.minX >= activeFrame.maxX {
+      if frame.minX >= visibleFrame.maxX {
         break
       }
-      if frame.maxX > activeFrame.minX {
+      if frame.maxX > visibleFrame.minX {
         visibleIndexes.append(index)
       }
       index += 1

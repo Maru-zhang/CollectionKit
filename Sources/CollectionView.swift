@@ -9,15 +9,20 @@
 import UIKit
 
 open class CollectionView: UIScrollView {
-  public var provider: AnyCollectionProvider = BaseCollectionProvider() { didSet { setNeedsReload() } }
-  public var presenter: CollectionPresenter = CollectionPresenter() { didSet { setNeedsReload() } }
+
+  public var provider: Provider? {
+    didSet { setNeedsReload() }
+  }
+
+  public var animator: Animator = Animator() {
+    didSet { setNeedsReload() }
+  }
 
   public private(set) var reloadCount = 0
   public private(set) var needsReload = true
-  public private(set) var loading = false
-  public private(set) var reloading = false
-  public private(set) var screenDragLocation: CGPoint = .zero
-  public private(set) var scrollVelocity: CGPoint = .zero
+  public private(set) var needsInvalidateLayout = false
+  public private(set) var isLoadingCell = false
+  public private(set) var isReloading = false
   public var hasReloaded: Bool { return reloadCount > 0 }
 
   public let tapGestureRecognizer = UITapGestureRecognizer()
@@ -27,26 +32,13 @@ open class CollectionView: UIScrollView {
   public private(set) var visibleCells: [UIView] = []
   public private(set) var visibleIdentifiers: [String] = []
 
-  var currentlyInsertedCells: Set<UIView>?
-  var lastLoadBounds: CGRect?
+  public private(set) var lastLoadBounds: CGRect = .zero
+  public private(set) var contentOffsetChange: CGPoint = .zero
 
-  public var activeFrameInset: UIEdgeInsets? {
-    didSet {
-      if !reloading && activeFrameInset != oldValue {
-        loadCells()
-      }
-    }
-  }
-  open override var contentOffset: CGPoint {
-    didSet {
-      scrollVelocity = contentOffset - oldValue
-    }
-  }
-  var activeFrame: CGRect {
-    return UIEdgeInsetsInsetRect(visibleFrame, activeFrameInset ?? .zero)
-  }
+  lazy var flattenedProvider: ItemProvider = EmptyCollectionProvider()
+  var identifierCache: [Int: String] = [:]
 
-  public convenience init(provider: AnyCollectionProvider) {
+  public convenience init(provider: Provider) {
     self.init()
     self.provider = provider
   }
@@ -66,28 +58,22 @@ open class CollectionView: UIScrollView {
 
     tapGestureRecognizer.addTarget(self, action: #selector(tap(gesture:)))
     addGestureRecognizer(tapGestureRecognizer)
-
-    panGestureRecognizer.addTarget(self, action: #selector(pan(gesture:)))
   }
 
   @objc func tap(gesture: UITapGestureRecognizer) {
     for (cell, index) in zip(visibleCells, visibleIndexes).reversed() {
       if cell.point(inside: gesture.location(in: cell), with: nil) {
-        provider.didTap(view: cell, at: index)
+        flattenedProvider.didTap(view: cell, at: index)
         return
       }
     }
-  }
-
-  @objc func pan(gesture: UIPanGestureRecognizer) {
-    screenDragLocation = absoluteLocation(for: gesture.location(in: self))
   }
 
   open override func layoutSubviews() {
     super.layoutSubviews()
     if needsReload {
       reloadData()
-    } else if bounds.size != lastLoadBounds?.size {
+    } else if needsInvalidateLayout || bounds.size != lastLoadBounds.size {
       invalidateLayout()
     } else if bounds != lastLoadBounds {
       loadCells()
@@ -99,10 +85,16 @@ open class CollectionView: UIScrollView {
     setNeedsLayout()
   }
 
+  public func setNeedsInvalidateLayout() {
+    needsInvalidateLayout = true
+    setNeedsLayout()
+  }
+
   public func invalidateLayout() {
-    guard !loading && !reloading && hasReloaded else { return }
-    provider.layout(collectionSize: innerSize)
-    contentSize = provider.contentSize
+    guard !isLoadingCell && !isReloading && hasReloaded else { return }
+    flattenedProvider.layout(collectionSize: innerSize)
+    contentSize = flattenedProvider.contentSize
+    needsInvalidateLayout = false
     loadCells()
   }
 
@@ -112,86 +104,104 @@ open class CollectionView: UIScrollView {
    * they move out of the visibleFrame.
    */
   func loadCells() {
-    guard !loading && !reloading && hasReloaded else { return }
-    loading = true
+    guard !isLoadingCell && !isReloading && hasReloaded else { return }
+    isLoadingCell = true
 
-    _loadCells()
+    _loadCells(forceReload: false)
 
     for (cell, index) in zip(visibleCells, visibleIndexes) {
-      let presenter = cell.currentCollectionPresenter ?? self.presenter
-      presenter.update(collectionView: self, view: cell, at: index, frame: provider.frame(at: index))
+      let animator = cell.currentCollectionAnimator ?? self.animator
+      animator.update(collectionView: self, view: cell, at: index, frame: flattenedProvider.frame(at: index))
     }
 
-    loading = false
+    lastLoadBounds = bounds
+    isLoadingCell = false
   }
 
   // reload all frames. will automatically diff insertion & deletion
   public func reloadData(contentOffsetAdjustFn: (() -> CGPoint)? = nil) {
-    guard !reloading else { return }
-    provider.willReload()
-    reloading = true
+    guard !isReloading else { return }
+    provider?.willReload()
+    flattenedProvider = (provider ?? EmptyCollectionProvider()).flattenedProvider()
+    isReloading = true
 
-    provider.layout(collectionSize: innerSize)
+    flattenedProvider.layout(collectionSize: innerSize)
     let oldContentOffset = contentOffset
-    contentSize = provider.contentSize
+    contentSize = flattenedProvider.contentSize
     if let offset = contentOffsetAdjustFn?() {
-      let scrollVelocity = self.scrollVelocity
       contentOffset = offset
-      self.scrollVelocity = scrollVelocity
     }
-    let contentOffsetDiff = contentOffset - oldContentOffset
+    contentOffsetChange = contentOffset - oldContentOffset
 
-    currentlyInsertedCells = Set<UIView>()
-    _loadCells()
+    let oldVisibleCells = Set(visibleCells)
+    _loadCells(forceReload: true)
 
     for (cell, index) in zip(visibleCells, visibleIndexes) {
-      cell.currentCollectionPresenter = cell.collectionPresenter ?? provider.presenter(at: index)
-      let presenter = cell.currentCollectionPresenter ?? self.presenter
-      if !currentlyInsertedCells!.contains(cell) {
+      cell.currentCollectionAnimator = cell.collectionAnimator ?? flattenedProvider.animator(at: index)
+      let animator = cell.currentCollectionAnimator ?? self.animator
+      if oldVisibleCells.contains(cell) {
         // cell was on screen before reload, need to update the view.
-        provider.update(view: cell, at: index)
-        presenter.shift(collectionView: self, delta: contentOffsetDiff, view: cell,
-                        at: index, frame: provider.frame(at: index))
+        flattenedProvider.update(view: cell, at: index)
+        animator.shift(collectionView: self, delta: contentOffsetChange, view: cell,
+                        at: index, frame: flattenedProvider.frame(at: index))
       }
-      presenter.update(collectionView: self, view: cell,
-                       at: index, frame: provider.frame(at: index))
+      animator.update(collectionView: self, view: cell,
+                       at: index, frame: flattenedProvider.frame(at: index))
     }
-    currentlyInsertedCells = nil
 
+    lastLoadBounds = bounds
+    needsInvalidateLayout = false
     needsReload = false
     reloadCount += 1
-    reloading = false
-    provider.didReload()
+    isReloading = false
+    flattenedProvider.didReload()
   }
 
-  private func _loadCells() {
-    lastLoadBounds = bounds
+  private func _loadCells(forceReload: Bool) {
+    let newIndexes = flattenedProvider.visibleIndexes(visibleFrame: visibleFrame)
 
-    let newIndexes = provider.visibleIndexes(activeFrame: activeFrame)
-    let newIdentifiers = newIndexes.map { provider.identifier(at: $0) }
+    // optimization: we assume that corresponding identifier for each index doesnt change unless forceReload is true.
+    guard forceReload || newIndexes.last != visibleIndexes.last || newIndexes != visibleIndexes else {
+      return
+    }
 
-    let oldIdentifierToCellMap = Dictionary(uniqueKeysWithValues: zip(visibleIdentifiers, visibleCells))
+    if forceReload {
+      identifierCache.removeAll()
+    }
+
+    let newIdentifiers: [String] = newIndexes.map { index in
+      if let identifier = identifierCache[index] {
+        return identifier
+      } else {
+        let identifier = flattenedProvider.identifier(at: index)
+        identifierCache[index] = identifier
+        return identifier
+      }
+    }
+
+    var existingIdentifierToCellMap: [String: UIView] = [:]
     let newIdentifierSet = Set(newIdentifiers)
 
     // 1st pass, delete all removed cells
-    for (identifier, cell) in oldIdentifierToCellMap {
+    for (index, identifier) in visibleIdentifiers.enumerated() {
+      let cell = visibleCells[index]
       if !newIdentifierSet.contains(identifier) {
-        (cell.currentCollectionPresenter ?? presenter).delete(collectionView: self, view: cell)
+        (cell.currentCollectionAnimator ?? animator)?.delete(collectionView: self, view: cell)
+      } else {
+        existingIdentifierToCellMap[identifier] = cell
       }
     }
 
     // 2nd pass, insert new views
     let newCells: [UIView] = zip(newIdentifiers, newIndexes).map { identifier, index in
-      if let existingCell = oldIdentifierToCellMap[identifier] {
+      if let existingCell = existingIdentifierToCellMap[identifier] {
         return existingCell
       } else {
-        let cell = _generateCell(index: index)
-        currentlyInsertedCells?.insert(cell)
-        return cell
+        return _generateCell(index: index)
       }
     }
 
-    for (index, cell) in newCells.enumerated() {
+    for (index, cell) in newCells.enumerated() where subviews.get(index) !== cell {
       insertSubview(cell, at: index)
     }
 
@@ -201,13 +211,13 @@ open class CollectionView: UIScrollView {
   }
 
   private func _generateCell(index: Int) -> UIView {
-    let cell = provider.view(at: index)
-    let frame = provider.frame(at: index)
+    let cell = flattenedProvider.view(at: index)
+    let frame = flattenedProvider.frame(at: index)
     cell.bounds.size = frame.bounds.size
     cell.center = frame.center
-    cell.currentCollectionPresenter = cell.collectionPresenter ?? provider.presenter(at: index)
-    let presenter = cell.currentCollectionPresenter ?? self.presenter
-    presenter.insert(collectionView: self, view: cell, at: index, frame: provider.frame(at: index))
+    cell.currentCollectionAnimator = cell.collectionAnimator ?? flattenedProvider.animator(at: index)
+    let animator = cell.currentCollectionAnimator ?? self.animator
+    animator.insert(collectionView: self, view: cell, at: index, frame: flattenedProvider.frame(at: index))
     return cell
   }
 }
